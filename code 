@@ -1,0 +1,1719 @@
+#!/usr/bin/env python3
+"""
+Legal Document Intelligence Platform
+Single-file retrieval, reranking, clause extraction, and summarization engine
+for contracts, corporate policies, and regulatory collections.
+
+Features:
+- Structure-aware legal chunking preserving document, page, and section provenance
+- Metadata filtering (document type, jurisdiction, party, effective year, clause category)
+- Hybrid retrieval (dense embeddings + Okapi BM25 combined via Reciprocal Rank Fusion)
+- Two-stage reranking (cross-encoder, LLM pointwise scorer, or lexical-structural reranker)
+- Cited question answering with strict evidence grounding and refusal on low confidence
+- Clause discovery across collections and structured document summarization
+- Persistent SQLite store for large document collections
+- CLI interface and optional HTTP API server
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Configuration & Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_DB_PATH = os.environ.get("LEGAL_INDEX_DB", "legal_index.db")
+DEFAULT_CHUNK_WORDS = 180
+DEFAULT_CHUNK_OVERLAP = 35
+DEFAULT_EMBEDDING_DIM = 384
+
+STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has",
+    "have", "he", "in", "is", "it", "its", "of", "on", "or", "that", "the",
+    "to", "was", "were", "will", "with", "this", "these", "those", "such",
+    "any", "all", "may", "shall", "under", "upon", "into", "within", "without",
+    "between", "through", "during", "before", "after", "above", "below", "each",
+    "other", "than", "then", "not", "no", "nor", "but", "if", "so", "do",
+    "does", "did", "can", "could", "should", "would", "been", "being", "their",
+    "there", "they", "them", "we", "us", "our", "you", "your",
+})
+
+CLAUSE_TAXONOMY: Dict[str, List[str]] = {
+    "Limitation of Liability": [
+        "limitation of liability", "aggregate liability", "consequential damages",
+        "indirect damages", "liability cap", "fees paid", "super-cap", "incidental",
+    ],
+    "Indemnification": [
+        "indemnify", "indemnification", "hold harmless", "defend", "third-party claim",
+        "infringement claim", "indemnified party",
+    ],
+    "Termination": [
+        "termination", "terminate", "for convenience", "for cause", "material breach",
+        "cure period", "notice period", "survival", "post-termination",
+    ],
+    "Confidentiality": [
+        "confidential information", "non-disclosure", "proprietary information",
+        "trade secret", "receiving party", "disclosing party", "confidentiality period",
+    ],
+    "Data Protection & Breach": [
+        "personal data", "data breach", "security incident", "gdpr", "ccpa",
+        "subprocessor", "data subject", "controller", "processor", "breach notification",
+    ],
+    "Intellectual Property": [
+        "intellectual property", "ownership", "work made for hire", "license grant",
+        "background ip", "foreground ip", "deliverables", "derivative works",
+    ],
+    "Governing Law & Dispute": [
+        "governing law", "jurisdiction", "arbitration", "venue", "dispute resolution",
+        "waiver of jury", "courts of", "laws of the state",
+    ],
+    "Payment & SLA": [
+        "payment terms", "invoicing", "late fee", "service level", "uptime",
+        "service credit", "net 30", "net 45", "maintenance window", "availability",
+    ],
+}
+
+SECTION_HEADER_RE = re.compile(
+    r"^(?:(?:ARTICLE|SECTION|CLAUSE)\s+([IVXLC]+|\d+(?:\.\d+)*)\b[:.\-\s]*(.*)|"
+    r"(\d+(?:\.\d+){0,3})[.)]\s+([A-Z][^\n]{2,110}))$",
+    re.IGNORECASE,
+)
+
+PAGE_MARKER_RE = re.compile(
+    r"(?:^|\n)(?:\f|---\s*Page\s+(\d+)\s*---|\[Page\s+(\d+)\]|Page\s+(\d+)\s+of\s+\d+)(?:\n|$)",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LegalDocument:
+    doc_id: str
+    title: str
+    doc_type: str
+    jurisdiction: str
+    effective_date: str
+    parties: List[str]
+    confidentiality: str = "Internal"
+    source_path: str = ""
+    raw_text: str = ""
+    page_count: int = 1
+
+    @property
+    def effective_year(self) -> Optional[int]:
+        match = re.search(r"\b(19|20)\d{2}\b", self.effective_date or "")
+        return int(match.group(0)) if match else None
+
+
+@dataclass
+class DocumentChunk:
+    chunk_id: str
+    doc_id: str
+    doc_title: str
+    doc_type: str
+    jurisdiction: str
+    effective_date: str
+    effective_year: Optional[int]
+    parties: List[str]
+    confidentiality: str
+    page_start: int
+    page_end: int
+    section_number: str
+    section_title: str
+    clause_category: str
+    chunk_index: int
+    char_start: int
+    char_end: int
+    text: str
+    embedding: List[float] = field(default_factory=list)
+
+    @property
+    def citation_label(self) -> str:
+        page_str = (
+            f"p. {self.page_start}"
+            if self.page_start == self.page_end
+            else f"pp. {self.page_start}-{self.page_end}"
+        )
+        sec_str = f"Sec. {self.section_number}" if self.section_number else "General"
+        if self.section_title:
+            sec_str = f"{sec_str} ({self.section_title})"
+        return f"{self.doc_title}, {page_str}, {sec_str}"
+
+
+@dataclass
+class MetadataFilter:
+    doc_ids: Optional[List[str]] = None
+    doc_types: Optional[List[str]] = None
+    jurisdictions: Optional[List[str]] = None
+    parties: Optional[List[str]] = None
+    clause_categories: Optional[List[str]] = None
+    confidentiality: Optional[List[str]] = None
+    year_from: Optional[int] = None
+    year_to: Optional[int] = None
+
+    def matches(self, chunk: DocumentChunk) -> bool:
+        if self.doc_ids and chunk.doc_id not in self.doc_ids:
+            return False
+        if self.doc_types and chunk.doc_type.lower() not in {d.lower() for d in self.doc_types}:
+            return False
+        if self.jurisdictions and chunk.jurisdiction.lower() not in {j.lower() for j in self.jurisdictions}:
+            return False
+        if self.confidentiality and chunk.confidentiality.lower() not in {c.lower() for c in self.confidentiality}:
+            return False
+        if self.clause_categories and chunk.clause_category.lower() not in {c.lower() for c in self.clause_categories}:
+            return False
+        if self.parties:
+            chunk_parties = " ".join(chunk.parties).lower()
+            if not any(p.lower() in chunk_parties for p in self.parties):
+                return False
+        if self.year_from is not None:
+            if chunk.effective_year is None or chunk.effective_year < self.year_from:
+                return False
+        if self.year_to is not None:
+            if chunk.effective_year is None or chunk.effective_year > self.year_to:
+                return False
+        return True
+
+
+@dataclass
+class RetrievalCandidate:
+    chunk: DocumentChunk
+    dense_score: float
+    bm25_score: float
+    rrf_score: float
+    initial_rank: int
+    rerank_score: float = 0.0
+    final_rank: int = 0
+    rerank_reason: str = ""
+
+
+@dataclass
+class EvidenceSpan:
+    citation_index: int
+    doc_id: str
+    doc_title: str
+    page_start: int
+    page_end: int
+    section_number: str
+    section_title: str
+    clause_category: str
+    quote: str
+    rerank_score: float
+    initial_rank: int
+    final_rank: int
+
+
+@dataclass
+class QueryResponse:
+    query: str
+    answer: str
+    grounded: bool
+    citations: List[EvidenceSpan]
+    candidates_considered: int
+    filters_applied: Dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Text Utilities & Legal Chunking Engine
+# ---------------------------------------------------------------------------
+
+def tokenize(text: str) -> List[str]:
+    tokens = re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", text.lower())
+    return [t for t in tokens if len(t) > 1 and t not in STOPWORDS]
+
+
+def classify_clause(section_title: str, text: str) -> str:
+    combined = f"{section_title} {text}".lower()
+    best_cat = "General Provision"
+    best_hits = 0
+    for category, keywords in CLAUSE_TAXONOMY.items():
+        hits = 0
+        for kw in keywords:
+            if kw in section_title.lower():
+                hits += 3
+            elif kw in combined:
+                hits += 1
+        if hits > best_hits:
+            best_hits = hits
+            best_cat = category
+    return best_cat
+
+
+def split_into_pages(raw_text: str) -> List[Tuple[int, str]]:
+    """Extract explicit page boundaries from form feeds or page markers."""
+    normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\f" in normalized:
+        parts = normalized.split("\f")
+        return [(idx + 1, part.strip()) for idx, part in enumerate(parts) if part.strip()]
+
+    markers = list(PAGE_MARKER_RE.finditer(normalized))
+    if not markers:
+        return [(1, normalized.strip())]
+
+    pages: List[Tuple[int, str]] = []
+    if markers[0].start() > 0:
+        preamble = normalized[: markers[0].start()].strip()
+        if preamble:
+            pages.append((1, preamble))
+
+    for i, match in enumerate(markers):
+        page_num_str = match.group(1) or match.group(2) or match.group(3)
+        page_num = int(page_num_str) if page_num_str else (len(pages) + 1)
+        start = match.end()
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(normalized)
+        body = normalized[start:end].strip()
+        if body:
+            pages.append((page_num, body))
+    return pages or [(1, normalized.strip())]
+
+
+class LegalChunker:
+    """
+    Hierarchical clause-aware chunker for legal documents.
+
+    1. Segments document into pages while preserving exact page numbers.
+    2. Detects legal section/article/clause headings and tracks active hierarchy.
+    3. Packs paragraphs into chunks up to `chunk_words` with `overlap_words` tail
+       carry-over so cross-paragraph obligations stay intact.
+    4. Annotates every chunk with page range, section identifier, clause class,
+       and character offsets.
+    """
+
+    def __init__(
+        self,
+        chunk_words: int = DEFAULT_CHUNK_WORDS,
+        overlap_words: int = DEFAULT_CHUNK_OVERLAP,
+    ) -> None:
+        if overlap_words >= chunk_words:
+            raise ValueError("overlap_words must be strictly less than chunk_words")
+        self.chunk_words = chunk_words
+        self.overlap_words = overlap_words
+
+    def chunk_document(self, doc: LegalDocument) -> List[DocumentChunk]:
+        pages = split_into_pages(doc.raw_text)
+        doc.page_count = max((p for p, _ in pages), default=1)
+
+        # Build structured blocks: (page_num, section_num, section_title, text, char_offset)
+        blocks: List[Tuple[int, str, str, str, int]] = []
+        current_sec_num = "0"
+        current_sec_title = "Preamble"
+        running_offset = 0
+
+        for page_num, page_text in pages:
+            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", page_text) if p.strip()]
+            for para in paragraphs:
+                lines = [ln.strip() for ln in para.split("\n") if ln.strip()]
+                if not lines:
+                    continue
+                first_line = lines[0]
+                header_match = SECTION_HEADER_RE.match(first_line)
+                if header_match:
+                    sec_num = header_match.group(1) or header_match.group(3) or current_sec_num
+                    sec_title = (header_match.group(2) or header_match.group(4) or "").strip(" .:-")
+                    current_sec_num = sec_num
+                    current_sec_title = sec_title or current_sec_title
+                    body = "\n".join(lines[1:]).strip() if len(lines) > 1 else first_line
+                    blocks.append((page_num, current_sec_num, current_sec_title, body, running_offset))
+                else:
+                    blocks.append((page_num, current_sec_num, current_sec_title, para, running_offset))
+                running_offset += len(para) + 2
+
+        chunks: List[DocumentChunk] = []
+        chunk_idx = 0
+
+        # Group contiguous blocks belonging to the same section before windowing
+        grouped: List[List[Tuple[int, str, str, str, int]]] = []
+        for blk in blocks:
+            if grouped and grouped[-1][0][1] == blk[1] and grouped[-1][0][2] == blk[2]:
+                grouped[-1].append(blk)
+            else:
+                grouped.append([blk])
+
+        for group in grouped:
+            sec_num = group[0][1]
+            sec_title = group[0][2]
+            words_with_meta: List[Tuple[str, int, int]] = []
+
+            for page_num, _, _, text, offset in group:
+                for w_match in re.finditer(r"\S+", text):
+                    words_with_meta.append((w_match.group(0), page_num, offset + w_match.start()))
+
+            if not words_with_meta:
+                continue
+
+            step = max(1, self.chunk_words - self.overlap_words)
+            start_i = 0
+            while start_i < len(words_with_meta):
+                end_i = min(len(words_with_meta), start_i + self.chunk_words)
+                window = words_with_meta[start_i:end_i]
+                chunk_text = " ".join(w[0] for w in window)
+                page_start = min(w[1] for w in window)
+                page_end = max(w[1] for w in window)
+                char_start = window[0][2]
+                char_end = window[-1][2] + len(window[-1][0])
+
+                cid_seed = f"{doc.doc_id}:{chunk_idx}:{sec_num}:{char_start}"
+                chunk_id = hashlib.sha256(cid_seed.encode("utf-8")).hexdigest()[:16]
+                clause_cat = classify_clause(sec_title, chunk_text)
+
+                chunks.append(
+                    DocumentChunk(
+                        chunk_id=chunk_id,
+                        doc_id=doc.doc_id,
+                        doc_title=doc.title,
+                        doc_type=doc.doc_type,
+                        jurisdiction=doc.jurisdiction,
+                        effective_date=doc.effective_date,
+                        effective_year=doc.effective_year,
+                        parties=list(doc.parties),
+                        confidentiality=doc.confidentiality,
+                        page_start=page_start,
+                        page_end=page_end,
+                        section_number=sec_num,
+                        section_title=sec_title,
+                        clause_category=clause_cat,
+                        chunk_index=chunk_idx,
+                        char_start=char_start,
+                        char_end=char_end,
+                        text=chunk_text,
+                    )
+                )
+                chunk_idx += 1
+                if end_i >= len(words_with_meta):
+                    break
+                start_i += step
+
+        return chunks
+
+
+# ---------------------------------------------------------------------------
+# Embedding Providers (API, Local Sentence-Transformers, or Hashed Projection)
+# ---------------------------------------------------------------------------
+
+def _l2_normalize(vec: Sequence[float]) -> List[float]:
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm == 0.0:
+        return [0.0 for _ in vec]
+    return [v / norm for v in vec]
+
+
+def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))
+
+
+class EmbeddingClient:
+    """
+    Produces normalized dense vectors for semantic search.
+    Resolution order:
+      1. OpenAI-compatible embeddings endpoint (if OPENAI_API_KEY is set)
+      2. Local sentence-transformers model (if installed and enabled)
+      3. Deterministic character+word n-gram signed random projection (zero deps)
+    """
+
+    def __init__(self, dim: int = DEFAULT_EMBEDDING_DIM) -> None:
+        self.dim = dim
+        self.api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.api_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        self.embed_model = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+        self._st_model = None
+        if not self.api_key and os.environ.get("USE_SENTENCE_TRANSFORMERS", "0") == "1":
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+                model_name = os.environ.get("ST_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+                self._st_model = SentenceTransformer(model_name)
+            except Exception:
+                self._st_model = None
+
+    def embed_batch(self, texts: Sequence[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        if self.api_key:
+            return self._embed_remote(texts)
+        if self._st_model is not None:
+            vectors = self._st_model.encode(list(texts), normalize_embeddings=True)
+            return [v.tolist() for v in vectors]
+        return [self._embed_hashed(t) for t in texts]
+
+    def embed_one(self, text: str) -> List[float]:
+        return self.embed_batch([text])[0]
+
+    def _embed_remote(self, texts: Sequence[str]) -> List[List[float]]:
+        payload = json.dumps({"model": self.embed_model, "input": list(texts)}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.api_base}/embeddings",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                ordered = sorted(body["data"], key=lambda item: item["index"])
+                return [_l2_normalize(item["embedding"]) for item in ordered]
+        except Exception:
+            return [self._embed_hashed(t) for t in texts]
+
+    def _embed_hashed(self, text: str) -> List[float]:
+        """Deterministic subword + legal-phrase projection into R^dim."""
+        vec = [0.0] * self.dim
+        tokens = tokenize(text)
+        features: List[Tuple[str, float]] = []
+
+        for tok in tokens:
+            features.append((f"w:{tok}", 1.0))
+            if len(tok) >= 4:
+                padded = f"<{tok}>"
+                for i in range(len(padded) - 2):
+                    features.append((f"c:{padded[i:i+3]}", 0.35))
+
+        for i in range(len(tokens) - 1):
+            features.append((f"b:{tokens[i]}_{tokens[i+1]}", 1.35))
+
+        # Project clause taxonomy concepts into shared semantic buckets
+        lower = text.lower()
+        for category, kws in CLAUSE_TAXONOMY.items():
+            for kw in kws:
+                if kw in lower:
+                    features.append((f"concept:{category}", 1.8))
+                    break
+
+        for feat, weight in features:
+            digest = hashlib.blake2b(feat.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(digest[:4], "little") % self.dim
+            sign = 1.0 if (digest[4] & 1) == 0 else -1.0
+            vec[idx] += sign * weight
+
+        return _l2_normalize(vec)
+
+
+# ---------------------------------------------------------------------------
+# Okapi BM25 Sparse Retriever
+# ---------------------------------------------------------------------------
+
+class BM25Index:
+    def __init__(self, chunks: Sequence[DocumentChunk], k1: float = 1.5, b: float = 0.75) -> None:
+        self.k1 = k1
+        self.b = b
+        self.doc_count = len(chunks)
+        self.doc_freqs: Dict[str, int] = defaultdict(int)
+        self.term_freqs: Dict[str, Counter] = {}
+        self.doc_lengths: Dict[str, int] = {}
+
+        total_len = 0
+        for ch in chunks:
+            toks = tokenize(f"{ch.section_title} {ch.clause_category} {ch.text}")
+            counts = Counter(toks)
+            self.term_freqs[ch.chunk_id] = counts
+            self.doc_lengths[ch.chunk_id] = len(toks)
+            total_len += len(toks)
+            for term in counts:
+                self.doc_freqs[term] += 1
+
+        self.avg_len = (total_len / self.doc_count) if self.doc_count else 1.0
+
+    def score(self, query: str, chunk_id: str) -> float:
+        q_terms = tokenize(query)
+        tf_map = self.term_freqs.get(chunk_id)
+        if not tf_map or not q_terms:
+            return 0.0
+        dl = self.doc_lengths[chunk_id]
+        total = 0.0
+        for term in q_terms:
+            tf = tf_map.get(term, 0)
+            if tf == 0:
+                continue
+            df = self.doc_freqs.get(term, 0)
+            idf = math.log(1.0 + (self.doc_count - df + 0.5) / (df + 0.5))
+            denom = tf + self.k1 * (1.0 - self.b + self.b * (dl / self.avg_len))
+            total += idf * ((tf * (self.k1 + 1.0)) / denom)
+        return total
+
+
+# ---------------------------------------------------------------------------
+# Second-Stage Reranker
+# ---------------------------------------------------------------------------
+
+class LegalReranker:
+    """
+    Second-stage reranker operating on top-K hybrid candidates.
+    Supports:
+      - Cross-Encoder model via sentence-transformers (optional)
+      - LLM pointwise relevance scoring via OpenAI-compatible chat API (optional)
+      - Multi-signal legal reranker (exact phrase match, section header match,
+        query term coverage, proximity density, and semantic similarity)
+    """
+
+    def __init__(self) -> None:
+        self.api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.api_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        self.chat_model = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
+        self._cross_encoder = None
+        if os.environ.get("USE_CROSS_ENCODER", "0") == "1":
+            try:
+                from sentence_transformers import CrossEncoder  # type: ignore
+                model_name = os.environ.get("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+                self._cross_encoder = CrossEncoder(model_name)
+            except Exception:
+                self._cross_encoder = None
+
+    def rerank(
+        self,
+        query: str,
+        candidates: List[RetrievalCandidate],
+        top_n: int = 6,
+    ) -> List[RetrievalCandidate]:
+        if not candidates:
+            return []
+
+        if self._cross_encoder is not None:
+            pairs = [(query, f"{c.chunk.section_title}: {c.chunk.text}") for c in candidates]
+            raw_scores = self._cross_encoder.predict(pairs)
+            for cand, sc in zip(candidates, raw_scores):
+                cand.rerank_score = float(1.0 / (1.0 + math.exp(-float(sc))))
+                cand.rerank_reason = "Cross-encoder passage relevance score"
+        else:
+            self._score_structural(query, candidates)
+            if self.api_key and len(candidates) <= 15:
+                self._blend_llm_rerank(query, candidates)
+
+        candidates.sort(key=lambda c: c.rerank_score, reverse=True)
+        for rank, cand in enumerate(candidates, start=1):
+            cand.final_rank = rank
+        return candidates[:top_n]
+
+    def _score_structural(self, query: str, candidates: List[RetrievalCandidate]) -> None:
+        q_tokens = tokenize(query)
+        q_set = set(q_tokens)
+        q_bigrams = {f"{q_tokens[i]} {q_tokens[i+1]}" for i in range(len(q_tokens) - 1)}
+        q_lower = query.lower()
+
+        max_bm25 = max((c.bm25_score for c in candidates), default=1.0) or 1.0
+
+        for cand in candidates:
+            ch = cand.chunk
+            text_lower = ch.text.lower()
+            title_lower = f"{ch.section_title} {ch.clause_category}".lower()
+            doc_tokens = set(tokenize(text_lower))
+
+            coverage = (len(q_set & doc_tokens) / len(q_set)) if q_set else 0.0
+            title_hits = sum(1 for t in q_set if t in title_lower)
+            title_score = min(1.0, title_hits / max(1, min(len(q_set), 3)))
+            bigram_hits = sum(1 for bg in q_bigrams if bg in text_lower)
+            phrase_score = min(1.0, bigram_hits / max(1, len(q_bigrams))) if q_bigrams else 0.0
+
+            # Boost when query asks about numeric caps/days/notice periods and passage contains them
+            wants_quant = bool(re.search(r"\b(how many|how long|days|months|years|percent|cap|amount|fee|limit|notice|hours)\b", q_lower))
+            has_quant = bool(re.search(r"(\$\d|\d+%|\b\d+\s*(?:days?|hours?|months?|years?|business days?)\b)", text_lower))
+            quant_bonus = 0.12 if (wants_quant and has_quant) else 0.0
+
+            norm_bm25 = cand.bm25_score / max_bm25
+            dense_clamped = max(0.0, cand.dense_score)
+
+            score = (
+                0.30 * dense_clamped
+                + 0.22 * norm_bm25
+                + 0.22 * coverage
+                + 0.16 * title_score
+                + 0.10 * phrase_score
+                + quant_bonus
+            )
+            cand.rerank_score = round(min(0.99, score), 4)
+
+            reasons: List[str] = []
+            if title_score >= 0.5:
+                reasons.append(f"section heading match ({ch.section_title})")
+            if phrase_score > 0:
+                reasons.append("exact legal phrase overlap")
+            if quant_bonus > 0:
+                reasons.append("contains concrete numeric/temporal threshold")
+            if coverage >= 0.5:
+                reasons.append(f"{int(coverage * 100)}% query term coverage")
+            cand.rerank_reason = "; ".join(reasons) if reasons else "combined dense and lexical relevance"
+
+    def _blend_llm_rerank(self, query: str, candidates: List[RetrievalCandidate]) -> None:
+        items_text = "\n".join(
+            f"[{i}] ({c.chunk.citation_label}): {c.chunk.text[:450]}"
+            for i, c in enumerate(candidates)
+        )
+        prompt = (
+            "Score each legal passage from 0.0 to 1.0 for directly answering the legal question. "
+            'Return strict JSON: {"scores": [{"index": 0, "score": 0.92, "reason": "..."}]}.\n\n'
+            f"Question: {query}\n\nPassages:\n{items_text}"
+        )
+        payload = json.dumps({
+            "model": self.chat_model,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "You are a precise legal retrieval reranker."},
+                {"role": "user", "content": prompt},
+            ],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.api_base}/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                content = body["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                for row in parsed.get("scores", []):
+                    idx = int(row["index"])
+                    if 0 <= idx < len(candidates):
+                        llm_sc = max(0.0, min(1.0, float(row["score"])))
+                        candidates[idx].rerank_score = round(
+                            0.7 * llm_sc + 0.3 * candidates[idx].rerank_score, 4
+                        )
+                        if row.get("reason"):
+                            candidates[idx].rerank_reason = str(row["reason"])
+        except Exception:
+            return
+
+
+# ---------------------------------------------------------------------------
+# Persistent SQLite Vector & Metadata Store
+# ---------------------------------------------------------------------------
+
+class LegalIndexStore:
+    def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                doc_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                doc_type TEXT NOT NULL,
+                jurisdiction TEXT NOT NULL,
+                effective_date TEXT NOT NULL,
+                parties_json TEXT NOT NULL,
+                confidentiality TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                raw_text TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chunks (
+                chunk_id TEXT PRIMARY KEY,
+                doc_id TEXT NOT NULL,
+                doc_title TEXT NOT NULL,
+                doc_type TEXT NOT NULL,
+                jurisdiction TEXT NOT NULL,
+                effective_date TEXT NOT NULL,
+                effective_year INTEGER,
+                parties_json TEXT NOT NULL,
+                confidentiality TEXT NOT NULL,
+                page_start INTEGER NOT NULL,
+                page_end INTEGER NOT NULL,
+                section_number TEXT NOT NULL,
+                section_title TEXT NOT NULL,
+                clause_category TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                char_start INTEGER NOT NULL,
+                char_end INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                FOREIGN KEY(doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_type ON chunks(doc_type)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_jurisdiction ON chunks(jurisdiction)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_clause ON chunks(clause_category)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)")
+        self.conn.commit()
+
+    def upsert_document(self, doc: LegalDocument, chunks: Sequence[DocumentChunk]) -> None:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM chunks WHERE doc_id = ?", (doc.doc_id,))
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO documents
+            (doc_id, title, doc_type, jurisdiction, effective_date, parties_json,
+             confidentiality, source_path, page_count, raw_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                doc.doc_id,
+                doc.title,
+                doc.doc_type,
+                doc.jurisdiction,
+                doc.effective_date,
+                json.dumps(doc.parties),
+                doc.confidentiality,
+                doc.source_path,
+                doc.page_count,
+                doc.raw_text,
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO chunks
+            (chunk_id, doc_id, doc_title, doc_type, jurisdiction, effective_date,
+             effective_year, parties_json, confidentiality, page_start, page_end,
+             section_number, section_title, clause_category, chunk_index,
+             char_start, char_end, text, embedding_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    ch.chunk_id,
+                    ch.doc_id,
+                    ch.doc_title,
+                    ch.doc_type,
+                    ch.jurisdiction,
+                    ch.effective_date,
+                    ch.effective_year,
+                    json.dumps(ch.parties),
+                    ch.confidentiality,
+                    ch.page_start,
+                    ch.page_end,
+                    ch.section_number,
+                    ch.section_title,
+                    ch.clause_category,
+                    ch.chunk_index,
+                    ch.char_start,
+                    ch.char_end,
+                    ch.text,
+                    json.dumps(ch.embedding),
+                )
+                for ch in chunks
+            ],
+        )
+        self.conn.commit()
+
+    def list_documents(self) -> List[LegalDocument]:
+        cur = self.conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT doc_id, title, doc_type, jurisdiction, effective_date,
+                   parties_json, confidentiality, source_path, page_count, raw_text
+            FROM documents
+            ORDER BY title ASC
+            """
+        ).fetchall()
+        return [
+            LegalDocument(
+                doc_id=r[0],
+                title=r[1],
+                doc_type=r[2],
+                jurisdiction=r[3],
+                effective_date=r[4],
+                parties=json.loads(r[5]),
+                confidentiality=r[6],
+                source_path=r[7],
+                page_count=r[8],
+                raw_text=r[9],
+            )
+            for r in rows
+        ]
+
+    def get_document(self, doc_id: str) -> Optional[LegalDocument]:
+        for d in self.list_documents():
+            if d.doc_id == doc_id:
+                return d
+        return None
+
+    def load_chunks(self, doc_id: Optional[str] = None) -> List[DocumentChunk]:
+        cur = self.conn.cursor()
+        if doc_id:
+            rows = cur.execute(
+                "SELECT * FROM chunks WHERE doc_id = ? ORDER BY chunk_index ASC",
+                (doc_id,),
+            ).fetchall()
+        else:
+            rows = cur.execute("SELECT * FROM chunks ORDER BY doc_id, chunk_index ASC").fetchall()
+
+        results: List[DocumentChunk] = []
+        for r in rows:
+            results.append(
+                DocumentChunk(
+                    chunk_id=r[0],
+                    doc_id=r[1],
+                    doc_title=r[2],
+                    doc_type=r[3],
+                    jurisdiction=r[4],
+                    effective_date=r[5],
+                    effective_year=r[6],
+                    parties=json.loads(r[7]),
+                    confidentiality=r[8],
+                    page_start=r[9],
+                    page_end=r[10],
+                    section_number=r[11],
+                    section_title=r[12],
+                    clause_category=r[13],
+                    chunk_index=r[14],
+                    char_start=r[15],
+                    char_end=r[16],
+                    text=r[17],
+                    embedding=json.loads(r[18]),
+                )
+            )
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Grounded Synthesizer & Summarizer
+# ---------------------------------------------------------------------------
+
+class LegalSynthesizer:
+    """
+    Produces cited legal answers and document summaries.
+    Uses an OpenAI-compatible chat model when OPENAI_API_KEY is configured,
+    and falls back to deterministic extractive synthesis with strict citations
+    when running offline.
+    """
+
+    def __init__(self) -> None:
+        self.api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.api_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        self.chat_model = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
+
+    def synthesize_answer(
+        self,
+        query: str,
+        ranked_candidates: List[RetrievalCandidate],
+        min_score: float = 0.22,
+    ) -> Tuple[str, bool, List[EvidenceSpan]]:
+        strong = [c for c in ranked_candidates if c.rerank_score >= min_score]
+        if not strong:
+            return (
+                "Insufficient supporting evidence found in the indexed legal corpus under the active filters. "
+                "Try broadening metadata filters or ingesting the relevant governing document.",
+                False,
+                [],
+            )
+
+        evidence: List[EvidenceSpan] = []
+        for idx, cand in enumerate(strong, start=1):
+            ch = cand.chunk
+            evidence.append(
+                EvidenceSpan(
+                    citation_index=idx,
+                    doc_id=ch.doc_id,
+                    doc_title=ch.doc_title,
+                    page_start=ch.page_start,
+                    page_end=ch.page_end,
+                    section_number=ch.section_number,
+                    section_title=ch.section_title,
+                    clause_category=ch.clause_category,
+                    quote=ch.text,
+                    rerank_score=cand.rerank_score,
+                    initial_rank=cand.initial_rank,
+                    final_rank=cand.final_rank,
+                )
+            )
+
+        if self.api_key:
+            llm_answer = self._call_llm_qa(query, evidence)
+            if llm_answer:
+                return llm_answer, True, evidence
+
+        return self._extractive_answer(query, evidence), True, evidence
+
+    def _call_llm_qa(self, query: str, evidence: List[EvidenceSpan]) -> Optional[str]:
+        context = "\n\n".join(
+            f"[{ev.citation_index}] {ev.doc_title} | Page {ev.page_start}"
+            f"{f'-{ev.page_end}' if ev.page_end != ev.page_start else ''} | "
+            f"Section {ev.section_number} ({ev.section_title})\n{ev.quote}"
+            for ev in evidence
+        )
+        system_msg = (
+            "You are a legal document analyst. Answer the question strictly from the numbered source excerpts. "
+            "Cite every factual claim inline using [1], [2], etc. Include document, page, and section references "
+            "where helpful. If the excerpts do not answer part of the question, state that clearly without guessing."
+        )
+        payload = json.dumps({
+            "model": self.chat_model,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": f"Question: {query}\n\nSource Excerpts:\n{context}"},
+            ],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.api_base}/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return str(body["choices"][0]["message"]["content"]).strip()
+        except Exception:
+            return None
+
+    def _extractive_answer(self, query: str, evidence: List[EvidenceSpan]) -> str:
+        q_terms = set(tokenize(query))
+        lines: List[str] = []
+        for ev in evidence[:4]:
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ev.quote) if len(s.strip()) > 20]
+            scored = sorted(
+                sentences,
+                key=lambda s: len(q_terms & set(tokenize(s))),
+                reverse=True,
+            )
+            best_excerpt = " ".join(scored[:2]) if scored else ev.quote[:320]
+            page_ref = f"p. {ev.page_start}" if ev.page_start == ev.page_end else f"pp. {ev.page_start}-{ev.page_end}"
+            lines.append(
+                f"- {best_excerpt} [{ev.citation_index}: {ev.doc_title}, {page_ref}, Sec. {ev.section_number} ({ev.section_title})]"
+            )
+        return "Based on the retrieved legal provisions:\n" + "\n".join(lines)
+
+    def summarize_document(self, doc: LegalDocument, chunks: List[DocumentChunk]) -> Dict[str, Any]:
+        if self.api_key:
+            llm_summary = self._call_llm_summary(doc, chunks)
+            if llm_summary:
+                return llm_summary
+
+        section_map: Dict[str, List[DocumentChunk]] = defaultdict(list)
+        for ch in chunks:
+            key = f"{ch.section_number} {ch.section_title}".strip()
+            section_map[key].append(ch)
+
+        obligations: List[Dict[str, str]] = []
+        thresholds: List[Dict[str, str]] = []
+        risk_flags: List[Dict[str, str]] = []
+
+        for ch in chunks:
+            page_ref = f"p. {ch.page_start}" if ch.page_start == ch.page_end else f"pp. {ch.page_start}-{ch.page_end}"
+            ref = f"{page_ref}, Sec. {ch.section_number} ({ch.section_title})"
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ch.text) if s.strip()]
+
+            for sent in sentences:
+                lower = sent.lower()
+                if any(m in lower for m in ("shall ", "must ", "agrees to ", "warrants ")):
+                    if len(obligations) < 6:
+                        obligations.append({"obligation": sent, "reference": ref})
+                if re.search(r"(\$\d|\d+%|\b\d+\s*(?:days?|hours?|months?|years?|business days?)\b)", lower):
+                    if len(thresholds) < 6:
+                        thresholds.append({"term": sent, "reference": ref})
+                if any(r in lower for r in ("unlimited", "sole discretion", "indemnify", "cap", "breach", "liquidated", "auto-renew")):
+                    if len(risk_flags) < 5:
+                        risk_flags.append({
+                            "category": ch.clause_category,
+                            "detail": sent,
+                            "reference": ref,
+                        })
+
+        section_outline = [
+            {
+                "section": sec_label,
+                "clause_category": sec_chunks[0].clause_category,
+                "pages": (
+                    f"p. {sec_chunks[0].page_start}"
+                    if sec_chunks[0].page_start == sec_chunks[-1].page_end
+                    else f"pp. {sec_chunks[0].page_start}-{sec_chunks[-1].page_end}"
+                ),
+                "excerpt": sec_chunks[0].text[:240].rstrip() + ("..." if len(sec_chunks[0].text) > 240 else ""),
+            }
+            for sec_label, sec_chunks in section_map.items()
+        ]
+
+        overview = (
+            f"{doc.title} is a {doc.doc_type} governed by {doc.jurisdiction} law "
+            f"(effective {doc.effective_date}) between {', '.join(doc.parties)}. "
+            f"The document spans {doc.page_count} page(s) across {len(section_outline)} indexed section(s)."
+        )
+
+        return {
+            "doc_id": doc.doc_id,
+            "title": doc.title,
+            "doc_type": doc.doc_type,
+            "jurisdiction": doc.jurisdiction,
+            "effective_date": doc.effective_date,
+            "parties": doc.parties,
+            "executive_overview": overview,
+            "key_obligations": obligations,
+            "key_thresholds_and_dates": thresholds,
+            "risk_considerations": risk_flags,
+            "section_outline": section_outline,
+        }
+
+    def _call_llm_summary(self, doc: LegalDocument, chunks: List[DocumentChunk]) -> Optional[Dict[str, Any]]:
+        condensed = "\n\n".join(
+            f"[Page {ch.page_start}, Sec. {ch.section_number} ({ch.section_title})]\n{ch.text}"
+            for ch in chunks[:24]
+        )
+        prompt = (
+            "Summarize this legal document into strict JSON with keys: "
+            "executive_overview (string), key_obligations (list of {obligation, reference}), "
+            "key_thresholds_and_dates (list of {term, reference}), "
+            "risk_considerations (list of {category, detail, reference}). "
+            "Every reference must cite page and section numbers.\n\n"
+            f"Document: {doc.title} ({doc.doc_type}, {doc.jurisdiction}, effective {doc.effective_date})\n\n"
+            f"{condensed}"
+        )
+        payload = json.dumps({
+            "model": self.chat_model,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "You are a senior corporate counsel preparing an executive brief."},
+                {"role": "user", "content": prompt},
+            ],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.api_base}/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                parsed = json.loads(body["choices"][0]["message"]["content"])
+                parsed.update({
+                    "doc_id": doc.doc_id,
+                    "title": doc.title,
+                    "doc_type": doc.doc_type,
+                    "jurisdiction": doc.jurisdiction,
+                    "effective_date": doc.effective_date,
+                    "parties": doc.parties,
+                })
+                return parsed
+        except Exception:
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Main Legal Document Intelligence Engine
+# ---------------------------------------------------------------------------
+
+class LegalIntelligencePlatform:
+    def __init__(
+        self,
+        db_path: str = DEFAULT_DB_PATH,
+        chunk_words: int = DEFAULT_CHUNK_WORDS,
+        overlap_words: int = DEFAULT_CHUNK_OVERLAP,
+    ) -> None:
+        self.store = LegalIndexStore(db_path)
+        self.chunker = LegalChunker(chunk_words=chunk_words, overlap_words=overlap_words)
+        self.embedder = EmbeddingClient()
+        self.reranker = LegalReranker()
+        self.synthesizer = LegalSynthesizer()
+
+    def ingest_document(self, doc: LegalDocument) -> int:
+        chunks = self.chunker.chunk_document(doc)
+        if not chunks:
+            return 0
+        texts = [f"{c.doc_title} | {c.section_title} | {c.text}" for c in chunks]
+        vectors = self.embedder.embed_batch(texts)
+        for ch, vec in zip(chunks, vectors):
+            ch.embedding = vec
+        self.store.upsert_document(doc, chunks)
+        return len(chunks)
+
+    def ingest_file(
+        self,
+        path: Path,
+        doc_type: str = "Contract",
+        jurisdiction: str = "Delaware, US",
+        effective_date: str = "2025-01-01",
+        parties: Optional[List[str]] = None,
+        confidentiality: str = "Confidential",
+    ) -> int:
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+            items = data if isinstance(data, list) else [data]
+            total = 0
+            for item in items:
+                doc = LegalDocument(
+                    doc_id=item.get("doc_id") or hashlib.sha1(item["title"].encode()).hexdigest()[:12],
+                    title=item["title"],
+                    doc_type=item.get("doc_type", doc_type),
+                    jurisdiction=item.get("jurisdiction", jurisdiction),
+                    effective_date=item.get("effective_date", effective_date),
+                    parties=item.get("parties", parties or ["Unspecified Parties"]),
+                    confidentiality=item.get("confidentiality", confidentiality),
+                    source_path=str(path),
+                    raw_text=item["text"],
+                )
+                total += self.ingest_document(doc)
+            return total
+
+        if suffix == ".pdf":
+            try:
+                from pypdf import PdfReader  # type: ignore
+                reader = PdfReader(str(path))
+                pages = [f"--- Page {i + 1} ---\n{p.extract_text() or ''}" for i, p in enumerate(reader.pages)]
+                raw_text = "\n\n".join(pages)
+            except ImportError as exc:
+                raise RuntimeError("Install 'pypdf' to ingest PDF files: pip install pypdf") from exc
+        else:
+            raw_text = path.read_text(encoding="utf-8")
+
+        doc_id = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+        doc = LegalDocument(
+            doc_id=doc_id,
+            title=path.stem.replace("_", " ").replace("-", " ").title(),
+            doc_type=doc_type,
+            jurisdiction=jurisdiction,
+            effective_date=effective_date,
+            parties=parties or ["Party A", "Party B"],
+            confidentiality=confidentiality,
+            source_path=str(path),
+            raw_text=raw_text,
+        )
+        return self.ingest_document(doc)
+
+    def search(
+        self,
+        query: str,
+        filters: Optional[MetadataFilter] = None,
+        stage1_k: int = 24,
+        top_n: int = 6,
+    ) -> Tuple[List[RetrievalCandidate], int]:
+        all_chunks = self.store.load_chunks()
+        filtered = [ch for ch in all_chunks if filters is None or filters.matches(ch)]
+        if not filtered:
+            return [], 0
+
+        bm25 = BM25Index(filtered)
+        q_vec = self.embedder.embed_one(query)
+
+        dense_scores = {ch.chunk_id: cosine_similarity(q_vec, ch.embedding) for ch in filtered}
+        bm25_scores = {ch.chunk_id: bm25.score(query, ch.chunk_id) for ch in filtered}
+
+        dense_order = sorted(filtered, key=lambda c: dense_scores[c.chunk_id], reverse=True)
+        bm25_order = sorted(filtered, key=lambda c: bm25_scores[c.chunk_id], reverse=True)
+
+        dense_rank = {ch.chunk_id: i + 1 for i, ch in enumerate(dense_order)}
+        bm25_rank = {ch.chunk_id: i + 1 for i, ch in enumerate(bm25_order)}
+
+        rrf_k = 60.0
+        candidates: List[RetrievalCandidate] = []
+        for ch in filtered:
+            rrf = (1.0 / (rrf_k + dense_rank[ch.chunk_id])) + (1.0 / (rrf_k + bm25_rank[ch.chunk_id]))
+            candidates.append(
+                RetrievalCandidate(
+                    chunk=ch,
+                    dense_score=round(dense_scores[ch.chunk_id], 4),
+                    bm25_score=round(bm25_scores[ch.chunk_id], 4),
+                    rrf_score=round(rrf, 6),
+                    initial_rank=0,
+                )
+            )
+
+        candidates.sort(key=lambda c: c.rrf_score, reverse=True)
+        shortlist = candidates[:stage1_k]
+        for idx, cand in enumerate(shortlist, start=1):
+            cand.initial_rank = idx
+
+        reranked = self.reranker.rerank(query, shortlist, top_n=top_n)
+        return reranked, len(filtered)
+
+    def answer_question(
+        self,
+        query: str,
+        filters: Optional[MetadataFilter] = None,
+        top_n: int = 5,
+    ) -> QueryResponse:
+        ranked, considered = self.search(query, filters=filters, top_n=top_n)
+        answer_text, grounded, citations = self.synthesizer.synthesize_answer(query, ranked)
+        return QueryResponse(
+            query=query,
+            answer=answer_text,
+            grounded=grounded,
+            citations=citations,
+            candidates_considered=considered,
+            filters_applied=asdict(filters) if filters else {},
+        )
+
+    def find_clauses(
+        self,
+        clause_category: str,
+        filters: Optional[MetadataFilter] = None,
+        top_n: int = 10,
+    ) -> List[EvidenceSpan]:
+        keywords = CLAUSE_TAXONOMY.get(clause_category, [clause_category])
+        query = f"{clause_category}: {' '.join(keywords[:6])}"
+        effective_filter = filters or MetadataFilter()
+        ranked, _ = self.search(query, filters=effective_filter, stage1_k=30, top_n=top_n)
+
+        spans: List[EvidenceSpan] = []
+        for idx, cand in enumerate(ranked, start=1):
+            ch = cand.chunk
+            spans.append(
+                EvidenceSpan(
+                    citation_index=idx,
+                    doc_id=ch.doc_id,
+                    doc_title=ch.doc_title,
+                    page_start=ch.page_start,
+                    page_end=ch.page_end,
+                    section_number=ch.section_number,
+                    section_title=ch.section_title,
+                    clause_category=ch.clause_category,
+                    quote=ch.text,
+                    rerank_score=cand.rerank_score,
+                    initial_rank=cand.initial_rank,
+                    final_rank=cand.final_rank,
+                )
+            )
+        return spans
+
+    def summarize_document(self, doc_id: str) -> Dict[str, Any]:
+        doc = self.store.get_document(doc_id)
+        if not doc:
+            raise KeyError(f"Document not found: {doc_id}")
+        chunks = self.store.load_chunks(doc_id=doc_id)
+        return self.synthesizer.summarize_document(doc, chunks)
+
+    def seed_sample_corpus(self) -> int:
+        total = 0
+        for sample in SAMPLE_LEGAL_CORPUS:
+            total += self.ingest_document(sample)
+        return total
+
+
+# ---------------------------------------------------------------------------
+# Sample Multi-Document Legal Corpus (for immediate verification & testing)
+# ---------------------------------------------------------------------------
+
+SAMPLE_LEGAL_CORPUS: List[LegalDocument] = [
+    LegalDocument(
+        doc_id="msa-northstar-2025",
+        title="Master Services Agreement — Northstar Logistics & Meridian Cloud",
+        doc_type="Master Services Agreement",
+        jurisdiction="Delaware, US",
+        effective_date="2025-02-15",
+        parties=["Northstar Logistics Inc.", "Meridian Cloud Systems LLC"],
+        confidentiality="Confidential",
+        raw_text=textwrap.dedent("""
+            --- Page 1 ---
+            1. Scope of Services and Deliverables
+            Meridian Cloud Systems LLC ("Provider") shall design, configure, and maintain the managed freight analytics platform for Northstar Logistics Inc. ("Customer") in accordance with each executed Statement of Work (SOW). Provider shall perform all Services in a professional and workmanlike manner consistent with prevailing enterprise software standards.
+
+            2. Fees and Payment Terms
+            Customer shall pay undisputed invoices within thirty (30) calendar days of receipt (Net 30). Undisputed amounts remaining unpaid more than fifteen (15) days past due shall accrue interest at 1.0% per month or the maximum rate permitted by Delaware law, whichever is lower. Customer must notify Provider in writing of any good-faith invoice dispute within twenty (20) business days of receipt.
+
+            --- Page 2 ---
+            3. Intellectual Property Ownership
+            Customer retains sole and exclusive ownership of all Customer Data, pre-existing materials, and custom analytics configurations specifically paid for under an SOW ("Custom Deliverables"). Provider retains all right, title, and interest in its underlying platform software, reusable libraries, and generalized operational telemetry ("Provider Background IP"). Upon full payment, Provider grants Customer a perpetual, worldwide, non-exclusive license to use any Provider Background IP embedded in Custom Deliverables.
+
+            4. Confidentiality Obligations
+            Each party shall hold the other party's Confidential Information in strict confidence using at least the same degree of care it uses to protect its own confidential materials, and in no event less than reasonable care. Confidentiality obligations survive expiration or termination of this Agreement for five (5) years, except that obligations regarding trade secrets continue for so long as such information remains a trade secret under applicable law.
+
+            --- Page 3 ---
+            5. Indemnification
+            Provider shall defend, indemnify, and hold harmless Customer and its officers, directors, and employees against any third-party claim alleging that the Services or Custom Deliverables infringe any valid patent, copyright, or trade secret. Customer shall promptly notify Provider in writing of any claim and grant Provider sole control of the defense, provided Provider may not settle any claim that admits fault or imposes monetary obligations on Customer without Customer's prior written consent.
+
+            6. Limitation of Liability
+            EXCEPT FOR EXCLUDED CLAIMS, NEITHER PARTY SHALL BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR LOSS OF PROFITS OR REVENUE. EXCEPT FOR SUPER-CAP CLAIMS, EACH PARTY'S AGGREGATE LIABILITY UNDER THIS AGREEMENT SHALL NOT EXCEED THE TOTAL FEES PAID OR PAYABLE BY CUSTOMER IN THE TWELVE (12) MONTHS PRECEDING THE EVENT GIVING RISE TO LIABILITY. FOR BREACHES OF CONFIDENTIALITY OR DATA SECURITY OBLIGATIONS ("SUPER-CAP CLAIMS"), AGGREGATE LIABILITY SHALL BE CAPPED AT THREE TIMES (3X) THE FEES PAID IN THE PRECEDING TWELVE (12) MONTHS. INDEMNIFICATION OBLIGATIONS AND WILLFUL MISCONDUCT ARE UNCAPPED ("EXCLUDED CLAIMS").
+
+            --- Page 4 ---
+            7. Term and Termination
+            This Agreement commences on February 15, 2025 for an initial term of three (3) years and automatically renews for successive one-year periods unless either party delivers written notice of non-renewal at least sixty (60) days prior to the end of the then-current term. Either party may terminate for cause upon thirty (30) days' written notice of a material breach if such breach remains uncured at the expiration of the notice period. Customer may terminate any SOW for convenience upon forty-five (45) days' prior written notice, subject to payment for Services actually rendered through the effective termination date.
+
+            8. Governing Law and Dispute Resolution
+            This Agreement is governed by and construed in accordance with the laws of the State of Delaware, without regard to conflict-of-law principles. Any dispute not resolved through executive escalation within thirty (30) days shall be submitted exclusively to the state or federal courts located in New Castle County, Delaware.
+        """).strip(),
+    ),
+    LegalDocument(
+        doc_id="dpa-eu-uk-2025",
+        title="Data Processing Addendum (GDPR & UK GDPR)",
+        doc_type="Data Processing Addendum",
+        jurisdiction="European Union",
+        effective_date="2025-02-15",
+        parties=["Northstar Logistics Inc.", "Meridian Cloud Systems LLC"],
+        confidentiality="Restricted",
+        raw_text=textwrap.dedent("""
+            --- Page 1 ---
+            1. Roles and Processing Scope
+            Northstar Logistics Inc. acts as Data Controller and Meridian Cloud Systems LLC acts as Data Processor with respect to Personal Data processed under the Master Services Agreement. Processor shall process Personal Data solely on documented instructions from Controller, including regarding international transfers.
+
+            2. Security of Processing
+            Processor shall implement and maintain technical and organizational safeguards aligned with ISO/IEC 27001 and SOC 2 Type II, including AES-256 encryption at rest, TLS 1.3 encryption in transit, role-based access controls, multi-factor authentication for all administrative access, and annual third-party penetration testing.
+
+            --- Page 2 ---
+            3. Personal Data Breach Notification
+            Processor shall notify Controller without undue delay and in any event within twenty-four (24) hours after becoming aware of a confirmed Personal Data Breach affecting Controller's Personal Data. The notification shall describe the nature of the breach, categories and approximate number of affected data subjects, likely consequences, and containment measures taken or proposed. Processor shall provide rolling forensic updates every twelve (12) hours until containment is verified.
+
+            4. Subprocessors
+            Controller grants general written authorization for the Subprocessors listed in Annex III. Processor shall provide at least thirty (30) calendar days' advance written notice before appointing or replacing any Subprocessor. Controller may object on reasonable data protection grounds within fifteen (15) days of notice; if Processor cannot offer a commercially reasonable workaround, Controller may terminate the affected Services without penalty and receive a pro-rata refund of prepaid unused fees.
+
+            --- Page 3 ---
+            5. Cross-Border Transfers and Deletion
+            Transfers of Personal Data outside the European Economic Area or United Kingdom shall be governed by the European Commission Standard Contractual Clauses (Module Two: Controller to Processor) and the UK International Data Transfer Addendum. Within thirty (30) days following termination of the Services, Processor shall securely delete or return all Personal Data and certify deletion in writing within ten (10) business days thereafter.
+        """).strip(),
+    ),
+    LegalDocument(
+        doc_id="policy-infosec-2026",
+        title="Enterprise Information Security & Incident Response Policy",
+        doc_type="Corporate Policy",
+        jurisdiction="United States & EU",
+        effective_date="2026-01-10",
+        parties=["Northstar Logistics Inc."],
+        confidentiality="Internal",
+        raw_text=textwrap.dedent("""
+            --- Page 1 ---
+            1. Policy Purpose and Applicability
+            This Policy establishes mandatory security controls and incident response timelines for all employees, contractors, and third-party vendors handling Northstar Logistics systems, source code, or regulated customer records.
+
+            2. Access Control and Key Management
+            Privileged access to production databases requires hardware-backed MFA and just-in-time elevation expiring after four (4) hours. Encryption keys must rotate every ninety (90) days for production data stores. Quarterly access recertifications are mandatory for all engineering and legal personnel.
+
+            --- Page 2 ---
+            3. Incident Classification and Escalation
+            Severity 1 incidents involve confirmed unauthorized access to customer personal data, ransomware deployment, or production outages exceeding two (2) hours. Severity 1 incidents must be escalated to the CISO and General Counsel within one (1) hour of detection. External regulatory notifications required under GDPR Article 33 must be prepared by Legal within forty-eight (48) hours to ensure submission inside the statutory seventy-two (72) hour window.
+
+            4. Vendor Risk Management
+            All Tier-1 software vendors processing confidential or personal data must submit an annual SOC 2 Type II report or ISO 27001 certificate and execute the standard Data Processing Addendum prior to production onboarding.
+        """).strip(),
+    ),
+    LegalDocument(
+        doc_id="nda-mutual-2024",
+        title="Mutual Non-Disclosure Agreement — Apex Robotics Partnership",
+        doc_type="Non-Disclosure Agreement",
+        jurisdiction="California, US",
+        effective_date="2024-09-01",
+        parties=["Northstar Logistics Inc.", "Apex Robotics Corp."],
+        confidentiality="Confidential",
+        raw_text=textwrap.dedent("""
+            --- Page 1 ---
+            1. Definition of Confidential Information
+            Confidential Information means any non-public technical, financial, commercial, or operational data disclosed by either party in connection with evaluating an automated warehouse robotics pilot, whether disclosed orally, visually, or in writing.
+
+            2. Exclusions from Confidentiality
+            Obligations do not apply to information that: (a) becomes publicly available without breach of this Agreement; (b) was rightfully known to the Receiving Party prior to disclosure; (c) is independently developed without reference to Confidential Information; or (d) is required to be disclosed by court order, provided prompt advance notice is given where legally permissible.
+
+            --- Page 2 ---
+            3. Term, Return of Materials, and Remedies
+            This Agreement remains in effect for two (2) years from September 1, 2024, and confidentiality duties survive for three (3) years after disclosure. Upon written request, the Receiving Party must destroy or return all tangible and electronic copies within ten (10) business days, excluding routine automated archival backups retained under standard disaster recovery schedules. Each party acknowledges that unauthorized disclosure may cause irreparable harm entitling the Disclosing Party to seek injunctive relief without posting bond.
+
+            4. Governing Law
+            This Agreement is governed by the laws of the State of California, with exclusive venue in the state and federal courts of Santa Clara County, California.
+        """).strip(),
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Optional HTTP Server (FastAPI)
+# ---------------------------------------------------------------------------
+
+def run_http_server(platform: LegalIntelligencePlatform, host: str, port: int) -> None:
+    try:
+        from fastapi import FastAPI, HTTPException  # type: ignore
+        from pydantic import BaseModel  # type: ignore
+        import uvicorn  # type: ignore
+    except ImportError as exc:
+        raise SystemExit(
+            "HTTP server requires fastapi and uvicorn: pip install fastapi uvicorn"
+        ) from exc
+
+    app = FastAPI(title="Legal Document Intelligence Platform", version="1.0.0")
+
+    class FilterPayload(BaseModel):
+        doc_ids: Optional[List[str]] = None
+        doc_types: Optional[List[str]] = None
+        jurisdictions: Optional[List[str]] = None
+        parties: Optional[List[str]] = None
+        clause_categories: Optional[List[str]] = None
+        confidentiality: Optional[List[str]] = None
+        year_from: Optional[int] = None
+        year_to: Optional[int] = None
+
+    class QueryPayload(BaseModel):
+        query: str
+        top_n: int = 5
+        filters: Optional[FilterPayload] = None
+
+    class ClausePayload(BaseModel):
+        clause_category: str
+        top_n: int = 8
+        filters: Optional[FilterPayload] = None
+
+    class IngestPayload(BaseModel):
+        doc_id: Optional[str] = None
+        title: str
+        doc_type: str = "Contract"
+        jurisdiction: str = "Delaware, US"
+        effective_date: str = "2025-01-01"
+        parties: List[str] = ["Party A", "Party B"]
+        confidentiality: str = "Confidential"
+        text: str
+
+    @app.get("/documents")
+    def list_docs() -> List[Dict[str, Any]]:
+        return [
+            {
+                "doc_id": d.doc_id,
+                "title": d.title,
+                "doc_type": d.doc_type,
+                "jurisdiction": d.jurisdiction,
+                "effective_date": d.effective_date,
+                "parties": d.parties,
+                "confidentiality": d.confidentiality,
+                "page_count": d.page_count,
+            }
+            for d in platform.store.list_documents()
+        ]
+
+    @app.post("/ingest")
+    def ingest(payload: IngestPayload) -> Dict[str, Any]:
+        doc_id = payload.doc_id or hashlib.sha1(payload.title.encode("utf-8")).hexdigest()[:12]
+        doc = LegalDocument(
+            doc_id=doc_id,
+            title=payload.title,
+            doc_type=payload.doc_type,
+            jurisdiction=payload.jurisdiction,
+            effective_date=payload.effective_date,
+            parties=payload.parties,
+            confidentiality=payload.confidentiality,
+            raw_text=payload.text,
+        )
+        chunks_created = platform.ingest_document(doc)
+        return {"doc_id": doc_id, "chunks_indexed": chunks_created}
+
+    @app.post("/query")
+    def query_endpoint(payload: QueryPayload) -> Dict[str, Any]:
+        flt = MetadataFilter(**payload.filters.model_dump()) if payload.filters else None
+        result = platform.answer_question(payload.query, filters=flt, top_n=payload.top_n)
+        return asdict(result)
+
+    @app.post("/clauses")
+    def clause_endpoint(payload: ClausePayload) -> Dict[str, Any]:
+        flt = MetadataFilter(**payload.filters.model_dump()) if payload.filters else None
+        spans = platform.find_clauses(payload.clause_category, filters=flt, top_n=payload.top_n)
+        return {"clause_category": payload.clause_category, "matches": [asdict(s) for s in spans]}
+
+    @app.get("/summarize/{doc_id}")
+    def summarize_endpoint(doc_id: str) -> Dict[str, Any]:
+        try:
+            return platform.summarize_document(doc_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    uvicorn.run(app, host=host, port=port)
+
+
+# ---------------------------------------------------------------------------
+# Command-Line Interface
+# ---------------------------------------------------------------------------
+
+def build_filter_from_args(args: argparse.Namespace) -> MetadataFilter:
+    return MetadataFilter(
+        doc_ids=args.doc_id or None,
+        doc_types=args.doc_type or None,
+        jurisdictions=args.jurisdiction or None,
+        parties=args.party or None,
+        clause_categories=args.clause or None,
+        confidentiality=args.confidentiality or None,
+        year_from=args.year_from,
+        year_to=args.year_to,
+    )
+
+
+def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--doc-id", action="append", help="Filter by document ID")
+    parser.add_argument("--doc-type", action="append", help="Filter by document type")
+    parser.add_argument("--jurisdiction", action="append", help="Filter by jurisdiction")
+    parser.add_argument("--party", action="append", help="Filter by counterparty name")
+    parser.add_argument("--clause", action="append", help="Filter by clause category")
+    parser.add_argument("--confidentiality", action="append", help="Filter by confidentiality tier")
+    parser.add_argument("--year-from", type=int, default=None, help="Minimum effective year")
+    parser.add_argument("--year-to", type=int, default=None, help="Maximum effective year")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="legal_intelligence.py",
+        description="Legal Document Intelligence Platform — RAG retrieval, reranking, clause discovery, and summarization.",
+    )
+    parser.add_argument("--db", default=DEFAULT_DB_PATH, help="SQLite index database path")
+    parser.add_argument("--chunk-words", type=int, default=DEFAULT_CHUNK_WORDS, help="Target words per chunk")
+    parser.add_argument("--overlap-words", type=int, default=DEFAULT_CHUNK_OVERLAP, help="Word overlap between chunks")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("seed", help="Index the built-in multi-document legal sample corpus")
+
+    p_ingest = sub.add_parser("ingest", help="Ingest a legal file (.txt, .md, .pdf, .json) or directory")
+    p_ingest.add_argument("path", help="File or directory path")
+    p_ingest.add_argument("--doc-type", default="Contract")
+    p_ingest.add_argument("--jurisdiction", default="Delaware, US")
+    p_ingest.add_argument("--effective-date", default="2025-01-01")
+    p_ingest.add_argument("--party", action="append", default=[])
+    p_ingest.add_argument("--confidentiality", default="Confidential")
+
+    sub.add_parser("list-docs", help="List all indexed legal documents")
+
+    p_query = sub.add_parser("query", help="Ask a legal question and receive a cited answer with evidence")
+    p_query.add_argument("question", help="Legal question to answer")
+    p_query.add_argument("--top-n", type=int, default=5)
+    p_query.add_argument("--json", action="store_true", dest="as_json")
+    add_filter_arguments(p_query)
+
+    p_clauses = sub.add_parser("clauses", help="Locate relevant clauses across the corpus")
+    p_clauses.add_argument("category", help=f"Clause category (e.g., {', '.join(CLAUSE_TAXONOMY.keys())})")
+    p_clauses.add_argument("--top-n", type=int, default=8)
+    p_clauses.add_argument("--json", action="store_true", dest="as_json")
+    add_filter_arguments(p_clauses)
+
+    p_sum = sub.add_parser("summarize", help="Generate a cited structured summary of an indexed document")
+    p_sum.add_argument("doc_id", help="Indexed document ID")
+    p_sum.add_argument("--json", action="store_true", dest="as_json")
+
+    p_serve = sub.add_parser("serve", help="Run the REST API server (requires fastapi & uvicorn)")
+    p_serve.add_argument("--host", default="0.0.0.0")
+    p_serve.add_argument("--port", type=int, default=8000)
+
+    args = parser.parse_args(argv)
+    platform = LegalIntelligencePlatform(
+        db_path=args.db,
+        chunk_words=args.chunk_words,
+        overlap_words=args.overlap_words,
+    )
+
+    if args.command == "seed":
+        count = platform.seed_sample_corpus()
+        print(f"Indexed {len(SAMPLE_LEGAL_CORPUS)} legal documents ({count} chunks) into {args.db}.")
+        return 0
+
+    if args.command == "ingest":
+        target = Path(args.path)
+        if not target.exists():
+            print(f"Path not found: {target}", file=sys.stderr)
+            return 1
+        files = [target] if target.is_file() else [
+            p for p in target.rglob("*") if p.suffix.lower() in {".txt", ".md", ".pdf", ".json"}
+        ]
+        total_chunks = 0
+        for file_path in files:
+            total_chunks += platform.ingest_file(
+                file_path,
+                doc_type=args.doc_type,
+                jurisdiction=args.jurisdiction,
+                effective_date=args.effective_date,
+                parties=args.party or None,
+                confidentiality=args.confidentiality,
+            )
+        print(f"Ingested {len(files)} file(s), indexed {total_chunks} chunk(s).")
+        return 0
+
+    if args.command == "list-docs":
+        docs = platform.store.list_documents()
+        if not docs:
+            print("No documents indexed. Run 'seed' or 'ingest' first.")
+            return 0
+        for d in docs:
+            print(
+                f"{d.doc_id:<22} | {d.doc_type:<26} | {d.jurisdiction:<18} | "
+                f"{d.effective_date} | {d.page_count}p | {d.title}"
+            )
+        return 0
+
+    if args.command == "query":
+        flt = build_filter_from_args(args)
+        resp = platform.answer_question(args.question, filters=flt, top_n=args.top_n)
+        if args.as_json:
+            print(json.dumps(asdict(resp), indent=2))
+            return 0
+        print(f"\nQuestion: {resp.query}")
+        print(f"Grounded: {'Yes' if resp.grounded else 'No'} (evaluated {resp.candidates_considered} filtered chunks)\n")
+        print(resp.answer)
+        if resp.citations:
+            print("\nSupporting Evidence:")
+            for ev in resp.citations:
+                pages = f"p. {ev.page_start}" if ev.page_start == ev.page_end else f"pp. {ev.page_start}-{ev.page_end}"
+                print(
+                    f"  [{ev.citation_index}] {ev.doc_title} | {pages} | "
+                    f"Sec. {ev.section_number} ({ev.section_title}) | "
+                    f"Rerank: {ev.rerank_score:.3f} (Rank {ev.initial_rank} -> {ev.final_rank})"
+                )
+                print(f"      \"{ev.quote[:240]}{'...' if len(ev.quote) > 240 else ''}\"")
+        return 0
+
+    if args.command == "clauses":
+        flt = build_filter_from_args(args)
+        spans = platform.find_clauses(args.category, filters=flt, top_n=args.top_n)
+        if args.as_json:
+            print(json.dumps([asdict(s) for s in spans], indent=2))
+            return 0
+        print(f"\nClause Discovery: {args.category} ({len(spans)} matches)\n")
+        for ev in spans:
+            pages = f"p. {ev.page_start}" if ev.page_start == ev.page_end else f"pp. {ev.page_start}-{ev.page_end}"
+            print(
+                f"[{ev.citation_index}] {ev.doc_title} — {pages}, Sec. {ev.section_number} ({ev.section_title}) "
+                f"[Category: {ev.clause_category}, Score: {ev.rerank_score:.3f}]"
+            )
+            print(f"    {ev.quote}\n")
+        return 0
+
+    if args.command == "summarize":
+        summary = platform.summarize_document(args.doc_id)
+        if args.as_json:
+            print(json.dumps(summary, indent=2))
+            return 0
+        print(f"\nSummary: {summary['title']}")
+        print(f"Type: {summary['doc_type']} | Jurisdiction: {summary['jurisdiction']} | Effective: {summary['effective_date']}\n")
+        print(summary["executive_overview"])
+        if summary.get("key_obligations"):
+            print("\nKey Obligations:")
+            for item in summary["key_obligations"]:
+                print(f"  - {item['obligation']} [{item['reference']}]")
+        if summary.get("key_thresholds_and_dates"):
+            print("\nKey Thresholds & Dates:")
+            for item in summary["key_thresholds_and_dates"]:
+                print(f"  - {item['term']} [{item['reference']}]")
+        if summary.get("risk_considerations"):
+            print("\nRisk Considerations:")
+            for item in summary["risk_considerations"]:
+                print(f"  - ({item['category']}) {item['detail']} [{item['reference']}]")
+        return 0
+
+    if args.command == "serve":
+        run_http_server(platform, host=args.host, port=args.port)
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
